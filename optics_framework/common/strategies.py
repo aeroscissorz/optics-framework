@@ -152,6 +152,42 @@ class LocatorStrategy(ABC):
             raise_if_session_dead(e)
             return False, None, None
 
+    @staticmethod
+    def _poll_frames_within_deadline(
+        ss_stream, end_time: float, poll_interval: float
+    ) -> Generator[list, None, None]:
+        """Yield batches of available screenshots, never waiting past ``end_time``.
+
+        This bounds the strategy's own sleep/wait granularity to whatever is left of
+        its allocated slice, so a strategy given e.g. 0.5s does not unconditionally
+        sleep for the full fixed ``poll_interval`` (1.5s) and overshoot its budget
+        (see issue #524). Each sleep and each stream wait is clamped to the remaining
+        time; the generator stops as soon as the deadline is reached.
+
+        :param ss_stream: An active screenshot stream exposing
+            ``get_all_available_screenshots(wait_time=...)``.
+        :param end_time: Absolute deadline (``time.time()`` epoch seconds).
+        :param poll_interval: Preferred sleep granularity between polls.
+        :yield: Lists of ``(frame, timestamp)`` tuples. Empty lists are not yielded;
+            instead the generator sleeps (bounded) and polls again until the deadline.
+        """
+        while True:
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                return
+            # Never sleep past the deadline.
+            time.sleep(min(poll_interval, remaining))
+
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                return
+            # Clamp the stream wait to whatever budget is left.
+            frames = ss_stream.get_all_available_screenshots(
+                wait_time=min(1, remaining)
+            )
+            if frames:
+                yield frames
+
 
 class XPathStrategy(LocatorStrategy):
     """Strategy for locating elements via XPath."""
@@ -303,12 +339,9 @@ class TextDetectionStrategy(LocatorStrategy):
         timestamp = None
         ss_stream = self.strategy_manager.capture_screenshot_stream(timeout=timeout)
         try:
-            while time.time() < end_time:
-                time.sleep(self.screenshot_timeout)  # Allow some time for screenshots to be captured
-                frames = ss_stream.get_all_available_screenshots(wait_time=1)
-                if not frames:
-                    time.sleep(self.screenshot_timeout)
-                    continue
+            for frames in self._poll_frames_within_deadline(
+                ss_stream, end_time, self.screenshot_timeout
+            ):
                 for frame, ts in frames:
                     current_frame = frame.copy()
                     _ , ocr_results = self.text_detection.detect_text(current_frame)
@@ -414,12 +447,9 @@ class ImageDetectionStrategy(LocatorStrategy):
         annotated_frame = None
         timestamp = None
         try:
-            while time.time() < end_time:
-                time.sleep(self.screenshot_timeout)  # Allow some time for screenshots to be captured
-                frames = ss_stream.get_all_available_screenshots(wait_time=1)
-                if not frames:
-                    time.sleep(self.screenshot_timeout)
-                    continue
+            for frames in self._poll_frames_within_deadline(
+                ss_stream, end_time, self.screenshot_timeout
+            ):
                 for frame, ts in frames:
                     current_frame = frame.copy()
                     result, annotated = self.image_detection.assert_elements(current_frame, elements, rule)
